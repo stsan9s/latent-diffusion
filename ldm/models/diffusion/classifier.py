@@ -38,6 +38,7 @@ class NoisyLatentImageClassifier(pl.LightningModule):
                  weight_decay=1.e-2,
                  log_steps=10,
                  monitor='val/loss',
+                 label_smoothing=0.0,
                  *args,
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -66,6 +67,7 @@ class NoisyLatentImageClassifier(pl.LightningModule):
         self.scheduler_config = scheduler_config
         self.use_scheduler = self.scheduler_config is not None
         self.weight_decay = weight_decay
+        self.label_smoothing = label_smoothing
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
         sd = torch.load(path, map_location="cpu")
@@ -190,7 +192,7 @@ class NoisyLatentImageClassifier(pl.LightningModule):
         x_noisy = self.get_x_noisy(x, t)
         logits = self(x_noisy, t)
 
-        loss = F.cross_entropy(logits, targets, reduction='none')
+        loss = F.cross_entropy(logits, targets, reduction='none', label_smoothing=self.label_smoothing)
 
         self.write_logs(loss.detach(), logits.detach(), targets.detach())
 
