@@ -43,7 +43,7 @@ class NoisyLatentImageClassifier(pl.LightningModule):
         super().__init__(*args, **kwargs)
         self.num_classes = num_classes
         # get latest config of diffusion model
-        diffusion_config = natsorted(glob(os.path.join(diffusion_path, 'configs', '*-project.yaml')))[-1]
+        diffusion_config = natsorted(glob(os.path.join(diffusion_path, 'config.yaml')))[-1]
         self.diffusion_config = OmegaConf.load(diffusion_config).model
         self.diffusion_config.params.ckpt_path = diffusion_ckpt_path
         self.load_diffusion()
@@ -109,13 +109,15 @@ class NoisyLatentImageClassifier(pl.LightningModule):
     @torch.no_grad()
     def get_x_noisy(self, x, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x))
-        continuous_sqrt_alpha_cumprod = None
-        if self.diffusion_model.use_continuous_noise:
-            continuous_sqrt_alpha_cumprod = self.diffusion_model.sample_continuous_noise_level(x.shape[0], t + 1)
+        # STEVEN - just use default noise
+        # continuous_sqrt_alpha_cumprod = None
+        # if self.diffusion_model.use_continuous_noise:
+        #     continuous_sqrt_alpha_cumprod = self.diffusion_model.sample_continuous_noise_level(x.shape[0], t + 1)
             # todo: make sure t+1 is correct here
 
-        return self.diffusion_model.q_sample(x_start=x, t=t, noise=noise,
-                                             continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod)
+        return self.diffusion_model.q_sample(x_start=x, t=t, noise=noise)
+        # return self.diffusion_model.q_sample(x_start=x, t=t, noise=noise,
+        #                                      continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod)
 
     def forward(self, x_noisy, t, *args, **kwargs):
         return self.model(x_noisy, t)
@@ -171,8 +173,8 @@ class NoisyLatentImageClassifier(pl.LightningModule):
         )
 
         self.log_dict(log, prog_bar=False, logger=True, on_step=self.training, on_epoch=True)
-        self.log('loss', log[f"{log_prefix}/loss"], prog_bar=True, logger=False)
-        self.log('global_step', self.global_step, logger=False, on_epoch=False, prog_bar=True)
+        # self.log('loss', log[f"{log_prefix}/loss"], prog_bar=True, logger=False)
+        # self.log('global_step', self.global_step, logger=False, on_epoch=False, prog_bar=True)
         lr = self.optimizers().param_groups[0]['lr']
         self.log('lr_abs', lr, on_step=True, logger=True, on_epoch=False, prog_bar=True)
 
