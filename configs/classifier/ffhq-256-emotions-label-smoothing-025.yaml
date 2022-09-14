@@ -3,9 +3,11 @@ model:
   target: ldm.models.diffusion.classifier.NoisyLatentImageClassifier
   params:
     diffusion_path: models/ldm/ffhq256/
+    # ckpt_path: /scratch/acd13649ev/logs/2022-08-31T10-53-17_ffhq-256-emotions/checkpoints/last.ckpt
     # label_key: None
     num_classes: 8
     diffusion_ckpt_path: models/ldm/ffhq256/model.ckpt
+    label_smoothing: 0.25
 data:
   target: ldm.modules.main_modules.DataModuleFromConfig
   params:
@@ -22,7 +24,7 @@ data:
       params:
         size: 256
         root: $SGE_LOCALDIR
-    predict:
+    prediction:
       target: ldm.data.ffhq.FFHQTestLabels
       params:
         size: 256

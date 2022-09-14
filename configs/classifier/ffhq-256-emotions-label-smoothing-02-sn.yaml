@@ -3,13 +3,16 @@ model:
   target: ldm.models.diffusion.classifier.NoisyLatentImageClassifier
   params:
     diffusion_path: models/ldm/ffhq256/
+    # ckpt_path: /scratch/acd13649ev/logs/2022-08-31T10-53-17_ffhq-256-emotions/checkpoints/last.ckpt
     # label_key: None
     num_classes: 8
     diffusion_ckpt_path: models/ldm/ffhq256/model.ckpt
+    label_smoothing: 0.2
+    spectral_norm: True
 data:
   target: ldm.modules.main_modules.DataModuleFromConfig
   params:
-    batch_size: 42
+    batch_size: 128
     num_workers: 5
     wrap: false
     train:

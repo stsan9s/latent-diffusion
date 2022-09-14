@@ -6,10 +6,12 @@ model:
     # label_key: None
     num_classes: 8
     diffusion_ckpt_path: models/ldm/ffhq256/model.ckpt
+    mix_up: True
+    alpha: 0.2
 data:
   target: ldm.modules.main_modules.DataModuleFromConfig
   params:
-    batch_size: 42
+    batch_size: 64
     num_workers: 5
     wrap: false
     train:

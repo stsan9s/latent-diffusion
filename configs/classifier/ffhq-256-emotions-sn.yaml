@@ -6,6 +6,7 @@ model:
     # label_key: None
     num_classes: 8
     diffusion_ckpt_path: models/ldm/ffhq256/model.ckpt
+    spectral_norm: True
 data:
   target: ldm.modules.main_modules.DataModuleFromConfig
   params:
@@ -17,16 +18,19 @@ data:
       params:
         size: 256
         root: $SGE_LOCALDIR
+        # root: 'data/ffhq'
     validation:
       target: ldm.data.ffhq.FFHQValidationLabels
       params:
         size: 256
         root: $SGE_LOCALDIR
+        # root: 'data/ffhq'
     predict:
       target: ldm.data.ffhq.FFHQTestLabels
       params:
         size: 256
         root: $SGE_LOCALDIR
+        # root: 'data/ffhq'
 
 
 lightning:
