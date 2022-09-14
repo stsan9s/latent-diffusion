@@ -6,14 +6,26 @@ from tqdm import tqdm
 from functools import partial
 
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
+from ldm.models.diffusion.classifier import NoisyLatentImageClassifier
 
 
 class PLMSSampler(object):
-    def __init__(self, model, schedule="linear", **kwargs):
+    def __init__(self, model, schedule="linear", classifier_args=None, **kwargs):
         super().__init__()
         self.model = model
         self.ddpm_num_timesteps = model.num_timesteps
         self.schedule = schedule
+
+        if classifier_args != None: # for classifier guidance
+            self.classifier = NoisyLatentImageClassifier(diffusion_path=classifier_args['diffusion_path'],
+                                                         num_classes=classifier_args['num_classes'],
+                                                         ckpt_path=classifier_args['ckpt_path'],
+                                                         diffusion_ckpt_path=classifier_args['diffusion_ckpt_path'],
+                                                         label_smoothing=classifier_args['label_smoothing'])
+            self.classifier.cuda()
+            self.classifier.eval()
+        else:
+            self.classifier = None
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
@@ -76,6 +88,9 @@ class PLMSSampler(object):
                log_every_t=100,
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None,
+               classifier_guidance=False,
+               classifier_guidance_scale=1,
+               y=None,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
                ):
@@ -108,6 +123,9 @@ class PLMSSampler(object):
                                                     log_every_t=log_every_t,
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
+                                                    classifier_guidance=classifier_guidance,
+                                                    classifier_guidance_scale=classifier_guidance_scale,
+                                                    y=y,
                                                     )
         return samples, intermediates
 
@@ -117,7 +135,8 @@ class PLMSSampler(object):
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,
+                      classifier_guidance=False, classifier_guidance_scale=1,y=None,):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -155,7 +174,9 @@ class PLMSSampler(object):
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
-                                      old_eps=old_eps, t_next=ts_next)
+                                      old_eps=old_eps, t_next=ts_next,
+                                      classifier_guidance=classifier_guidance,
+                                      classifier_guidance_scale=classifier_guidance_scale, y=y)
             img, pred_x0, e_t = outs
             old_eps.append(e_t)
             if len(old_eps) >= 4:
@@ -172,8 +193,18 @@ class PLMSSampler(object):
     @torch.no_grad()
     def p_sample_plms(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None, old_eps=None, t_next=None):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None, old_eps=None, t_next=None,
+                      classifier_guidance=False, classifier_guidance_scale=1, y=None):
         b, *_, device = *x.shape, x.device
+
+        # calculate gradient for classifier
+        if y is not None:
+            with torch.enable_grad():
+                x_in = x.detach().requires_grad_(True)
+                logits = self.classifier(x_in, t)
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                selected = log_probs[range(len(logits)), y]
+                classifier_grad = torch.autograd.grad(selected.sum(), x_in)[0] * classifier_guidance_scale
 
         def get_model_output(x, t):
             if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
@@ -203,6 +234,9 @@ class PLMSSampler(object):
             sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
             sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
 
+            if classifier_guidance:
+                e_t = e_t - sqrt_one_minus_at * classifier_grad
+
             # current prediction for x_0
             pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
             if quantize_denoised:
@@ -216,6 +250,7 @@ class PLMSSampler(object):
             return x_prev, pred_x0
 
         e_t = get_model_output(x, t)
+
         if len(old_eps) == 0:
             # Pseudo Improved Euler (2nd order)
             x_prev, pred_x0 = get_x_prev_and_pred_x0(e_t, index)

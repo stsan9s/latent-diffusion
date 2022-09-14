@@ -1,5 +1,6 @@
 import os
 import torch
+import numpy as np
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
 from torch.nn import functional as F
@@ -39,6 +40,12 @@ class NoisyLatentImageClassifier(pl.LightningModule):
                  log_steps=10,
                  monitor='val/loss',
                  label_smoothing=0.0,
+                 spectral_norm=False,
+                 mix_up=False,
+                 alpha=1.0,
+                 temperature_scaling=False,
+                 temperature=1,
+                 learning_rate = 1e-3,
                  *args,
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -68,6 +75,25 @@ class NoisyLatentImageClassifier(pl.LightningModule):
         self.use_scheduler = self.scheduler_config is not None
         self.weight_decay = weight_decay
         self.label_smoothing = label_smoothing
+        self.t = None   # used for predict_step for confidence reliability plot generation
+        self.mix_up = mix_up
+        self.alpha = alpha # to be used with mix up
+
+        def spectral_norm_apply(m):
+            try:
+                m = torch.nn.utils.parametrizations.spectral_norm(m)
+                return m
+            except:
+                return m
+
+        if spectral_norm:
+            self.model.apply(spectral_norm_apply)
+
+        self.temperature_scaling = temperature_scaling
+        self.temperature = torch.tensor([temperature]).cuda()
+
+        # needed for temperature_scalingp.py only
+        self.learning_rate = learning_rate
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
         sd = torch.load(path, map_location="cpu")
@@ -122,7 +148,10 @@ class NoisyLatentImageClassifier(pl.LightningModule):
         #                                      continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod)
 
     def forward(self, x_noisy, t, *args, **kwargs):
-        return self.model(x_noisy, t)
+        if self.temperature_scaling:
+            return self.model(x_noisy, t) / self.temperature
+        else:
+            return self.model(x_noisy, t)
 
     @torch.no_grad()
     def get_input(self, batch, k):
@@ -180,24 +209,49 @@ class NoisyLatentImageClassifier(pl.LightningModule):
         lr = self.optimizers().param_groups[0]['lr']
         self.log('lr_abs', lr, on_step=True, logger=True, on_epoch=False, prog_bar=True)
 
-    def shared_step(self, batch, t=None):
+    def mix_up_data(self, x, y, alpha=1.0):
+        if alpha > 0:
+            lam = np.random.beta(alpha, alpha)
+        else:
+            lam = 1
+        randperm = torch.randperm(len(x))
+        x = lam * x + (1 - lam) * x[randperm]
+        y = lam * y + (1 - lam) * y[randperm]   # make sure y is one hot encoded
+        return x, y
+
+    def shared_step(self, batch, t=None, logging=False, validating=False):
         x, *_ = self.diffusion_model.get_input(batch, k=self.diffusion_model.first_stage_key)
         targets = self.get_conditioning(batch)
+
+        if self.mix_up and not validating:
+            y = F.one_hot(targets, num_classes=self.num_classes)
+            x, y = self.mix_up_data(x, y, alpha=self.alpha)
+
         if targets.dim() == 4:
             targets = targets.argmax(dim=1)
         if t is None:
-            t = torch.randint(0, self.diffusion_model.num_timesteps, (x.shape[0],), device=self.device).long()
+            if self.temperature_scaling:
+                t = torch.randint(0, 250, (x.shape[0],), device=self.device).long()
+            else:
+                t = torch.randint(0, self.diffusion_model.num_timesteps, (x.shape[0],), device=self.device).long()
         else:
             t = torch.full(size=(x.shape[0],), fill_value=t, device=self.device).long()
         x_noisy = self.get_x_noisy(x, t)
         logits = self(x_noisy, t)
 
-        loss = F.cross_entropy(logits, targets, reduction='none', label_smoothing=self.label_smoothing)
+        if self.mix_up and not validating:
+            loss = F.cross_entropy(logits, y, reduction='none', label_smoothing=self.label_smoothing)
+        else:
+            loss = F.cross_entropy(logits, targets, reduction='none', label_smoothing=self.label_smoothing)
 
-        self.write_logs(loss.detach(), logits.detach(), targets.detach())
+        if logging and (not self.mix_up or validating): # mix up labels can't be logged
+            self.write_logs(loss.detach(), logits.detach(), targets.detach())
 
         loss = loss.mean()
-        return loss, logits, x_noisy, targets
+        if self.mix_up and not validating:
+            return loss, logits, x_noisy, y
+        else:
+            return loss, logits, x_noisy, targets
 
     def training_step(self, batch, batch_idx):
         loss, *_ = self.shared_step(batch)
@@ -212,17 +266,20 @@ class NoisyLatentImageClassifier(pl.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        loss, *_ = self.shared_step(batch)
+        loss, *_ = self.shared_step(batch, validating=True)
 
         for t in self.noisy_acc:
-            _, logits, _, targets = self.shared_step(batch, t)
+            _, logits, _, targets = self.shared_step(batch, t, validating=True)
             self.noisy_acc[t]['acc@1'].append(self.compute_top_k(logits, targets, k=1, reduction='mean'))
             self.noisy_acc[t]['acc@5'].append(self.compute_top_k(logits, targets, k=5, reduction='mean'))
 
         return loss
 
     def configure_optimizers(self):
-        optimizer = AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        if self.temperature_scaling:
+            optimizer = AdamW([self.temperature], lr=self.learning_rate)
+        else:
+            optimizer = AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
 
         if self.use_scheduler:
             scheduler = instantiate_from_config(self.scheduler_config)
@@ -269,3 +326,16 @@ class NoisyLatentImageClassifier(pl.LightningModule):
             log[key] = log[key][:N]
 
         return log
+    
+
+    def set_test_timestep(self, t):
+        self.t  = t
+
+
+    @torch.no_grad()
+    def predict_step(self, batch, batch_idx):
+        assert self.t != None, 'set the value of self.t first'
+        _, logits, _, targets = self.shared_step(batch, t=self.t, logging=False)
+        confidence = F.softmax(logits, dim=1)
+
+        return confidence, targets

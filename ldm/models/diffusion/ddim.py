@@ -6,14 +6,30 @@ from tqdm import tqdm
 from functools import partial
 
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
+from ldm.models.diffusion.classifier import NoisyLatentImageClassifier
 
 
 class DDIMSampler(object):
-    def __init__(self, model, schedule="linear", **kwargs):
+    def __init__(self, model, schedule="linear", classifier_args=None, **kwargs):
+        """
+        :param model: ldm model
+        :param classifier_args: (dictionary) {'diffusion_path': (str), 'num_classes': (int), 'ckpt_path': (str)} 
+        """
         super().__init__()
         self.model = model
         self.ddpm_num_timesteps = model.num_timesteps
         self.schedule = schedule
+
+        if classifier_args != None: # for classifier guidance
+            self.classifier = NoisyLatentImageClassifier(diffusion_path=classifier_args['diffusion_path'],
+                                                         num_classes=classifier_args['num_classes'],
+                                                         ckpt_path=classifier_args['ckpt_path'],
+                                                         diffusion_ckpt_path=classifier_args['diffusion_ckpt_path'],
+                                                         label_smoothing=classifier_args['label_smoothing'])
+            self.classifier.cuda()
+            self.classifier.eval()
+        else:
+            self.classifier = None
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
@@ -74,6 +90,9 @@ class DDIMSampler(object):
                log_every_t=100,
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None,
+               classifier_guidance=False,
+               classifier_guidance_scale=1,
+               y=None,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
                ):
@@ -85,6 +104,7 @@ class DDIMSampler(object):
             else:
                 if conditioning.shape[0] != batch_size:
                     print(f"Warning: Got {conditioning.shape[0]} conditionings but batch-size is {batch_size}")
+        assert classifier_guidance == (self.classifier != None) == (y != None), f'Classifier model exists={self.classifier != None}, classifier_guidance={classifier_guidance}, y={y}'
 
         self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=verbose)
         # sampling
@@ -106,6 +126,9 @@ class DDIMSampler(object):
                                                     log_every_t=log_every_t,
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
+                                                    classifier_guidance=classifier_guidance,
+                                                    classifier_guidance_scale=classifier_guidance_scale,
+                                                    y=y,
                                                     )
         return samples, intermediates
 
@@ -115,7 +138,8 @@ class DDIMSampler(object):
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,
+                      classifier_guidance=False, classifier_guidance_scale=1,y=None,):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -150,7 +174,9 @@ class DDIMSampler(object):
                                       noise_dropout=noise_dropout, score_corrector=score_corrector,
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
-                                      unconditional_conditioning=unconditional_conditioning)
+                                      unconditional_conditioning=unconditional_conditioning,
+                                      classifier_guidance=classifier_guidance,
+                                      classifier_guidance_scale=classifier_guidance_scale, y=y)
             img, pred_x0 = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
@@ -164,12 +190,22 @@ class DDIMSampler(object):
     @torch.no_grad()
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,
+                      classifier_guidance=False, classifier_guidance_scale=1, y=None):
         b, *_, device = *x.shape, x.device
+
+        # calculate gradient for classifier
+        if y is not None:
+            with torch.enable_grad():
+                x_in = x.detach().requires_grad_(True)
+                logits = self.classifier(x_in, t)
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                selected = log_probs[range(len(logits)), y]
+                classifier_grad = torch.autograd.grad(selected.sum(), x_in)[0] * classifier_guidance_scale
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             e_t = self.model.apply_model(x, t, c)
-        else:
+        else:   # classifier free guidance prob
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
             c_in = torch.cat([unconditional_conditioning, c])
@@ -189,6 +225,9 @@ class DDIMSampler(object):
         a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
         sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
         sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
+
+        if classifier_guidance:
+            e_t = e_t - sqrt_one_minus_at * classifier_grad
 
         # current prediction for x_0
         pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()

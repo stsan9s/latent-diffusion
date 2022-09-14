@@ -7,6 +7,7 @@ from tqdm import trange
 from omegaconf import OmegaConf
 from PIL import Image
 
+from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.util import instantiate_from_config
 
@@ -66,17 +67,21 @@ def convsample(model, shape, return_intermediates=True,
 
 
 @torch.no_grad()
-def convsample_ddim(model, steps, shape, eta=1.0
+def convsample_ddim(model, steps, shape, eta=1.0, y=None, ddim=None, classifier_scale=10
                     ):
-    ddim = DDIMSampler(model)
     bs = shape[0]
     shape = shape[1:]
-    samples, intermediates = ddim.sample(steps, batch_size=bs, shape=shape, eta=eta, verbose=False,)
+    if ddim.classifier == None:
+        samples, intermediates = ddim.sample(steps, batch_size=bs, shape=shape, eta=eta, verbose=False,)
+
+    else:
+        samples, intermediates = ddim.sample(steps, batch_size=bs, shape=shape, eta=eta, verbose=False, classifier_guidance=True, classifier_guidance_scale=classifier_scale, y=y,)
+
     return samples, intermediates
 
 
 @torch.no_grad()
-def make_convolutional_sample(model, batch_size, vanilla=False, custom_steps=None, eta=1.0,):
+def make_convolutional_sample(model, batch_size, vanilla=False, custom_steps=None, eta=1.0, y=None, ddim=None, classifier_scale=10):
 
 
     log = dict()
@@ -92,8 +97,10 @@ def make_convolutional_sample(model, batch_size, vanilla=False, custom_steps=Non
             sample, progrow = convsample(model, shape,
                                          make_prog_row=True)
         else:
+            assert ddim != None
             sample, intermediates = convsample_ddim(model,  steps=custom_steps, shape=shape,
-                                                    eta=eta)
+                                                    eta=eta, y=y, ddim=ddim,
+                                                    classifier_scale=classifier_scale)
 
         t1 = time.time()
 
@@ -105,9 +112,13 @@ def make_convolutional_sample(model, batch_size, vanilla=False, custom_steps=Non
     print(f'Throughput for this batch: {log["throughput"]}')
     return log
 
-def run(model, logdir, batch_size=50, vanilla=False, custom_steps=None, eta=None, n_samples=50000, nplog=None):
+def run(model, logdir, batch_size=50, vanilla=False, custom_steps=None, eta=None, n_samples=50000, nplog=None,
+        classifier_config='none', classifier_scale=10, plms=False
+        ):
     if vanilla:
         print(f'Using Vanilla DDPM sampling with {model.num_timesteps} sampling steps.')
+    elif plms:
+        print(f'Using plms sampling with {model.num_timesteps} sampling steps.')
     else:
         print(f'Using DDIM sampling with {custom_steps} sampling steps and eta={eta}')
 
@@ -115,14 +126,16 @@ def run(model, logdir, batch_size=50, vanilla=False, custom_steps=None, eta=None
     tstart = time.time()
     n_saved = len(glob.glob(os.path.join(logdir,'*.png')))-1
     # path = logdir
-    if model.cond_stage_model is None:
+    if classifier_config == 'none' and model.cond_stage_model is None:
         all_images = []
+
+        ddim = DDIMSampler(model)
 
         print(f"Running unconditional sampling for {n_samples} samples")
         for _ in trange(n_samples // batch_size, desc="Sampling Batches (unconditional)"):
             logs = make_convolutional_sample(model, batch_size=batch_size,
                                              vanilla=vanilla, custom_steps=custom_steps,
-                                             eta=eta)
+                                             eta=eta, ddim=ddim)
             n_saved = save_logs(logs, logdir, n_saved=n_saved, key="sample")
             all_images.extend([custom_to_np(logs["sample"])])
             if n_saved >= n_samples:
@@ -134,20 +147,76 @@ def run(model, logdir, batch_size=50, vanilla=False, custom_steps=None, eta=None
         nppath = os.path.join(nplog, f"{shape_str}-samples.npz")
         np.savez(nppath, all_img)
 
+    elif classifier_config != 'none':
+        assert not vanilla, 'classifier guidance only for ddpm & plms'
+        assert os.path.exists(classifier_config), 'classifier_config path does not exist'
+        all_images = []
+
+        classifier_args = get_classifier_args_from_config(classifier_config)
+        if plms:
+            ddim = PLMSSampler(model, classifier_args=classifier_args)  # too lazy to change var name
+        else:
+            ddim = DDIMSampler(model, classifier_args=classifier_args)
+
+        num_classes = OmegaConf.load(classifier_config).model.params.num_classes
+        print(f"Running classifier-guided sampling for {n_samples} samples per class")
+        for y in trange(num_classes, desc='Sampling across classes'):
+            n_saved = 0
+            for _ in trange(n_samples // batch_size, desc=f"Sampling Batches (CG) y: {y}"):
+                logs = make_convolutional_sample(model, batch_size=batch_size,
+                                                vanilla=vanilla, custom_steps=custom_steps,
+                                                eta=eta, y=y, ddim=ddim,
+                                                classifier_scale=classifier_scale)
+                n_saved = save_logs(logs, logdir, n_saved=n_saved, key="sample", y=y)
+                all_images.extend([custom_to_np(logs["sample"])])
+                if n_saved >= n_samples:
+                    print(f'Finish after generating {n_saved} samples')
+                    break
+        all_img = np.concatenate(all_images, axis=0)
+        all_img = all_img[:n_samples * num_classes]
+        shape_str = "x".join([str(x) for x in all_img.shape])
+        nppath = os.path.join(nplog, f"{shape_str}-samples.npz")
+        np.savez(nppath, all_img)
     else:
        raise NotImplementedError('Currently only sampling for unconditional models supported.')
 
     print(f"sampling of {n_saved} images finished in {(time.time() - tstart) / 60.:.2f} minutes.")
 
+def get_classifier_args_from_config(classifier_config):
+        classifier_settings = OmegaConf.load(classifier_config)
 
-def save_logs(logs, path, n_saved=0, key="sample", np_path=None):
+        classifier_args = {}
+        keys = ['diffusion_path', 'num_classes', 'ckpt_path', 'diffusion_ckpt_path', 'label_smoothing']
+        types = [str, int, str, str, float] # matching type conversions for key args
+        for k, typecast in zip(keys, types):
+            if k in classifier_settings.model.params.keys():
+                classifier_args[k] = typecast(classifier_settings.model.params[k])
+            elif k == 'ckpt_path':
+                back_len = sum([len(name) for name in classifier_config.split('/')[-2:]])
+                # assume path to model checkpoint relative to config file
+                classifier_ckpt_path = os.path.join(classifier_config[:-(back_len+1)], 'checkpoints', 'last.ckpt')
+                assert os.path.exists(classifier_ckpt_path), 'path to classifier checkpoint does not exist'
+                classifier_args[k] = classifier_ckpt_path
+            elif k == 'label_smoothing':
+                classifier_args[k] = 0.0
+            else:
+                raise Exception(f'Missing key {k} in specified config file')
+
+        return classifier_args
+
+
+def save_logs(logs, path, n_saved=0, key="sample", np_path=None, y=None):
     for k in logs:
         if k == key:
             batch = logs[key]
             if np_path is None:
                 for x in batch:
                     img = custom_to_pil(x)
-                    imgpath = os.path.join(path, f"{key}_{n_saved:06}.png")
+                    if y != None:
+                        sample_save_name = f"{key}_y{y}_{n_saved:06}.png"
+                    else:
+                        sample_save_name = f"{key}_{n_saved:06}.png"
+                    imgpath = os.path.join(path, sample_save_name)
                     img.save(imgpath)
                     n_saved += 1
             else:
@@ -192,6 +261,12 @@ def get_parser():
         help="vanilla sampling (default option is DDIM sampling)?",
     )
     parser.add_argument(
+        "--plms",
+        default=False,
+        action='store_true',
+        help='use plms sampler (higher precedence than vanilla & ddim arg)'
+    )
+    parser.add_argument(
         "-l",
         "--logdir",
         type=str,
@@ -212,6 +287,20 @@ def get_parser():
         type=int,
         nargs="?",
         help="the bs",
+        default=10
+    )
+    parser.add_argument(
+        "--classifier_config",
+        type=str,
+        nargs="?",
+        help="path to classifier config in the original logdir if using CG",
+        default="none"
+    )
+    parser.add_argument(
+        "--classifier_scale",
+        type=int,
+        nargs="?",
+        help="scale factor for classifier gradients if using CG",
         default=10
     )
     return parser
@@ -288,7 +377,12 @@ if __name__ == "__main__":
     print(f"global step: {global_step}")
     print(75 * "=")
     print("logging to:")
-    logdir = os.path.join(logdir, "samples", f"{global_step:08}", now)
+    if opt.plms:
+        logdir = os.path.join(logdir, "samples", "plms", f"{global_step:08}", now)
+    elif opt.vanilla_sample == False:
+        logdir = os.path.join(logdir, "samples", "ddim", f"{global_step:08}", now)
+    else:
+        logdir = os.path.join(logdir, "samples", "vanilla", f"{global_step:08}", now)
     imglogdir = os.path.join(logdir, "img")
     numpylogdir = os.path.join(logdir, "numpy")
 
@@ -308,6 +402,7 @@ if __name__ == "__main__":
 
     run(model, imglogdir, eta=opt.eta,
         vanilla=opt.vanilla_sample,  n_samples=opt.n_samples, custom_steps=opt.custom_steps,
-        batch_size=opt.batch_size, nplog=numpylogdir)
+        batch_size=opt.batch_size, nplog=numpylogdir, classifier_config=opt.classifier_config,
+        classifier_scale=opt.classifier_scale, plms=opt.plms)
 
     print("done.")
